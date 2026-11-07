@@ -1,9 +1,10 @@
 // lx — a plain-language evolution of `ls -l`.
 //
-// Same information as ls -l, but every column says what it means:
-// permissions as words, sizes in GB, folder sizes that include everything
-// inside them, and kinds of item that are distinct at a glance. `-T` turns
-// it into a TreeSize-style map of what's using the space.
+// Same information as ls -l, but every column says what it means: sizes
+// in GB, folder sizes that include everything inside them, kinds of item
+// that are distinct at a glance, and thumbnails beside pictures, videos
+// and songs. `-l` spells permissions out in words; `-T` turns it into a
+// TreeSize-style map of what's using the space.
 //
 // Standard library only; build with CGO_ENABLED=0 for a static binary that
 // runs on any Linux distribution.
@@ -17,7 +18,7 @@ import (
 	"time"
 )
 
-const version = "1.2.0"
+const version = "1.3.0"
 
 type Kind int
 
@@ -41,8 +42,9 @@ var kindWord = map[Kind]string{
 
 type Options struct {
 	All, Tree, Reverse, OneFS, Disk, NoSize, Wide bool
-	Sort, Units, Color                            string
-	Depth, Top, Width                             int
+	Long, NoThumbs, ForceThumbs                   bool
+	Sort, Units, Color, Graphics                  string
+	Depth, Top, Width, ThumbW                     int
 	MinPct                                        float64
 	Paths                                         []string
 }
@@ -53,8 +55,11 @@ Usage: lx [options] [path ...]
 
 LISTING (the default)
   Every item with its kind, size, last change, owner, and who can do what.
-  Folder sizes include everything inside them.
+  Folder sizes include everything inside them. Pictures, videos and songs
+  get a thumbnail beside them; permissions are shown as OWN GRP ALL letters.
 
+  -l, --long         the full view: OWNER CAN / GROUP CAN / EVERYONE CAN
+                     in words, no thumbnails
   -a, --all          also show hidden items (names starting with ".")
   -S                 sort by size, biggest first
   -t                 sort by last change, newest first
@@ -63,10 +68,21 @@ LISTING (the default)
   -h, --human        pick a readable unit per item (KB, MB, GB...)
       --units U      gb | mb | kb | bytes | auto   (default: gb)
       --no-size      don't measure folder contents (instant, sizes shown as —)
-      --wide         never fall back to r/w/x letters on narrow terminals
+      --wide         with -l, never fall back to r/w/x letters when narrow
       --width N      lay out for N columns (e.g. when piping into less -R);
                      piped output is otherwise one unwrapped line per item
-  -l                 accepted and ignored, for muscle memory
+
+THUMBNAILS
+      --no-thumbs    plain text listing, no pictures (also: -l)
+      --thumbs       show them even when piped (e.g. into less -R)
+      --thumb-size N thumbnail width in character cells   (default: 8)
+      --graphics G   auto | kitty | sixel | blocks        (default: auto)
+                     auto asks the terminal: kitty and sixel draw real
+                     pixels; blocks draws with colored ▀ characters and
+                     works everywhere, including over ssh and in tmux.
+  Previews come from your file manager's thumbnail cache when it has one,
+  Go's own decoders for PNG/JPEG/GIF, and ffmpeg (if installed) for video,
+  album art, WebP, HEIC, AVIF and the rest. lx never writes to the cache.
 
 SPACE MAP
   -T, --tree         show what is using the space, biggest first, as a tree
@@ -81,7 +97,7 @@ MEASURING
       --color WHEN   auto | always | never   (NO_COLOR is respected)
       --help, --version
 
-READING THE PERMISSION COLUMNS
+READING THE PERMISSION COLUMNS (OWN GRP ALL by default; words with -l)
   read    open and view a file  /  see what is in a folder
   write   change a file         /  add, rename or delete things in a folder
   run     start a file as a program
@@ -91,8 +107,9 @@ READING THE PERMISSION COLUMNS
 
 FITTING THE TERMINAL
   As the terminal narrows the listing shortens the date, merges OWNER:GROUP,
-  switches permissions to r/w/x letters, then drops the group. Long names
-  and notes wrap under the NAME column. Below that it shows one card per item.
+  then drops the group (and with -l, switches to r/w/x letters first).
+  Thumbnails go next, and below that it shows one card per item. Long names
+  and notes wrap under the NAME column.
 
 KINDS AT A GLANCE
   folder/  blue          program*  green        link → target  cyan
@@ -133,7 +150,7 @@ func main() {
 }
 
 func parseArgs(args []string) (*Options, error) {
-	o := &Options{Sort: "name", Units: "gb", Color: "auto", Depth: 3, Top: 10, MinPct: 1}
+	o := &Options{Sort: "name", Units: "gb", Color: "auto", Graphics: "auto", Depth: 3, Top: 10, MinPct: 1, ThumbW: 8}
 	needInt := func(name, v string) (int, error) {
 		n, err := strconv.Atoi(v)
 		if err != nil || n < 0 {
@@ -165,6 +182,28 @@ func parseArgs(args []string) (*Options, error) {
 			o.NoSize = true
 		case "wide":
 			o.Wide = true
+		case "long":
+			o.Long = true
+		case "no-thumbs", "no-thumbnails":
+			o.NoThumbs = true
+		case "thumbs", "thumbnails":
+			o.ForceThumbs = true
+		case "thumb-size":
+			if v, err = get(); err == nil {
+				o.ThumbW, err = needInt("--thumb-size", v)
+				if err == nil && (o.ThumbW < 2 || o.ThumbW > 80) {
+					err = fmt.Errorf("--thumb-size must be between 2 and 80 cells")
+				}
+			}
+		case "graphics":
+			if v, err = get(); err == nil {
+				switch v {
+				case "auto", "kitty", "sixel", "blocks":
+					o.Graphics = v
+				default:
+					err = fmt.Errorf("--graphics must be auto, kitty, sixel or blocks")
+				}
+			}
 		case "human", "human-readable":
 			o.Units = "auto"
 		case "help":
@@ -263,8 +302,10 @@ func parseArgs(args []string) (*Options, error) {
 					o.Sort = "size"
 				case 't':
 					o.Sort = "time"
-				case 'l', '1':
-					// ls habits; nothing to do
+				case 'l':
+					o.Long = true
+				case '1':
+					// ls habit; nothing to do
 				case 'L':
 					var v string
 					if j+1 < len(flags) {
