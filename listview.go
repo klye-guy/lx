@@ -2,8 +2,15 @@ package main
 
 // listview.go — rendering the listing so it fits whatever terminal it's in.
 //
-// The table degrades in steps as the terminal narrows, always keeping the
-// plain-language permission words as long as possible:
+// Two views share this code:
+//
+//   default  thumbnails beside media files, permissions collapsed into one
+//            "OWN GRP ALL" column of r/w/x letters
+//   -l       the full plain-language table: OWNER CAN / GROUP CAN /
+//            EVERYONE CAN spelled out in words, no thumbnails
+//
+// Each view degrades in steps as the terminal narrows. The -l ladder keeps
+// the permission words as long as possible:
 //
 //   1. full          LAST CHANGED with time, separate OWNER and GROUP
 //   2. short date    2026-10-30
@@ -11,6 +18,11 @@ package main
 //   4. letters       permissions as r/w/x, with a legend under the table
 //   5. no group      owner only
 //   6. cards         one small block per item, for very narrow terminals
+//
+// The default ladder starts compact and shortens the date, merges and then
+// drops the group, then the KIND column (names are still colored by kind);
+// if even that won't fit beside the thumbnails it drops the thumbnails,
+// and finally falls back to cards.
 //
 // Names and notes never push past the right edge: they wrap with a
 // hanging indent so the left-hand columns stay a clean block.
@@ -32,9 +44,19 @@ const (
 
 type layout struct {
 	shortDate, merged, letters, noGroup bool
+	compact                             bool // one "OWN GRP ALL" column (implies letters)
+	noKind                              bool // KIND dropped: color, gutter and / * suffixes still tell
 }
 
-var tiers = []layout{
+var compactTiers = []layout{
+	{compact: true, letters: true},
+	{compact: true, letters: true, shortDate: true},
+	{compact: true, letters: true, shortDate: true, merged: true},
+	{compact: true, letters: true, shortDate: true, noGroup: true},
+	{compact: true, letters: true, shortDate: true, noGroup: true, noKind: true},
+}
+
+var longTiers = []layout{
 	{},
 	{shortDate: true},
 	{shortDate: true, merged: true},
@@ -55,6 +77,7 @@ type row struct {
 	group    string
 	name     []span
 	notes    [][]span
+	thumb    *thumbCell // nil: no preview for this row
 }
 
 // ---------------------------------------------------------------- notes
@@ -138,7 +161,7 @@ func nameSpans(e *Entry) []span {
 	return []span{{name, kc}}
 }
 
-func makeRow(e *Entry, o *Options, p *Painter) *row {
+func makeRow(e *Entry, o *Options, p *Painter, thumbs map[*Entry]*thumbCell) *row {
 	r := &row{e: e, kindWord: kindWord[e.Kind], date: e.MTime, keepTime: o.Sort == "time",
 		owner: safeName(userName(e.UID)), group: safeName(groupName(e.GID))}
 	switch {
@@ -158,6 +181,12 @@ func makeRow(e *Entry, o *Options, p *Painter) *row {
 	}
 	r.name = nameSpans(e)
 	r.notes = noteSpans(e, p)
+	if t := thumbs[e]; t != nil {
+		r.thumb = t
+		if n := t.infoNote(); n != "" {
+			r.notes = append([][]span{{{n, "2"}}}, r.notes...)
+		}
+	}
 	return r
 }
 
@@ -274,6 +303,7 @@ func buildColumns(rows []*row, l layout, p *Painter) []*column {
 		ph = []string{"OWN", "GRP", "ALL"}
 	}
 	perms := []*column{{head: ph[0]}, {head: ph[1]}, {head: ph[2]}}
+	access := &column{head: "OWN GRP ALL"}
 
 	for _, r := range rows {
 		kind.cells = append(kind.cells, []span{{r.kindWord, kindCode(r.e.Kind)}})
@@ -285,15 +315,30 @@ func buildColumns(rows []*row, l layout, p *Painter) []*column {
 		for i := range perms {
 			perms[i].cells = append(perms[i].cells, pt[i])
 		}
+		if l.compact {
+			cell := padSpans(pt[0], 3, false)
+			cell = append(cell, span{" ", ""})
+			cell = append(cell, padSpans(pt[1], 3, false)...)
+			cell = append(cell, span{" ", ""})
+			cell = append(cell, pt[2]...)
+			access.cells = append(access.cells, cell)
+		}
 	}
 	cols := []*column{kind, size, date, owner}
+	if l.noKind {
+		cols = cols[1:]
+	}
 	if !l.merged && !l.noGroup {
 		cols = append(cols, group)
 	}
 	if l.noGroup {
 		owner.head = "OWNER"
 	}
-	cols = append(cols, perms...)
+	if l.compact {
+		cols = append(cols, access)
+	} else {
+		cols = append(cols, perms...)
+	}
 	for _, c := range cols {
 		c.w = dispWidth(c.head)
 		for _, cell := range c.cells {
@@ -335,10 +380,15 @@ func (p *Painter) gutterW() int {
 	return 1
 }
 
-func printTable(rows []*row, cols []*column, nameW int, p *Painter) {
+func printTable(rows []*row, cols []*column, nameW int, thumbW int, p *Painter) {
 	gw := p.gutterW()
 	fixed := fixedWidth(cols)
-	indent := strings.Repeat(" ", gw+fixed)
+	indent := strings.Repeat(" ", fixed)
+	thumbCol := ""
+	if thumbW > 0 {
+		thumbCol = strings.Repeat(" ", thumbW+len(gap))
+		fixed += thumbW + len(gap)
+	}
 
 	// widest name line actually used, for the rules
 	used := dispWidth("NAME")
@@ -356,7 +406,7 @@ func printTable(rows []*row, cols []*column, nameW int, p *Painter) {
 
 	// header
 	var h []span
-	h = append(h, span{strings.Repeat(" ", gw), ""})
+	h = append(h, span{strings.Repeat(" ", gw) + thumbCol, ""})
 	for _, c := range cols {
 		h = append(h, padSpans([]span{{c.head, "2;1"}}, c.w, c.right)...)
 		h = append(h, span{gap, ""})
@@ -366,17 +416,32 @@ func printTable(rows []*row, cols []*column, nameW int, p *Painter) {
 	rule(gw, total, p)
 
 	for i, r := range rows {
+		lines := outs[i].lines
+		var tc *thumbCell
+		if thumbW > 0 {
+			tc = r.thumb
+			for len(lines) < tc.height() {
+				lines = append(lines, nil)
+			}
+		}
+		thumb := func(k int) string {
+			if thumbW == 0 {
+				return ""
+			}
+			return tc.line(k, thumbW, p) + gap
+		}
 		var line []span
-		line = append(line, p.gutter(r.e.Kind, true)...)
 		for _, c := range cols {
 			line = append(line, padSpans(c.cells[i], c.w, c.right)...)
 			line = append(line, span{gap, ""})
 		}
-		lines := outs[i].lines
 		line = append(line, lines[0]...)
-		fmt.Println(strings.TrimRight(p.render(line), " "))
-		for _, l := range lines[1:] {
-			fmt.Println(indent + p.render(l))
+		fmt.Println(strings.TrimRight(p.render(p.gutter(r.e.Kind, true))+thumb(0)+p.render(line), " "))
+		for k, l := range lines[1:] {
+			fmt.Println(strings.TrimRight(strings.Repeat(" ", gw)+thumb(k+1)+indent+p.render(l), " "))
+		}
+		if tc != nil {
+			placeImage(tc, len(lines), gw+1)
 		}
 	}
 	rule(gw, total, p)
@@ -524,20 +589,19 @@ func outWidth(o *Options) int {
 	return 0 // piped and no --width: one line per item, never wrapped
 }
 
-func listView(path string, o *Options, p *Painter) error {
-	var st syscall.Stat_t
-	if err := syscall.Stat(path, &st); err != nil {
-		return &os.PathError{Op: "stat", Path: path, Err: err}
+// readEntries lists a folder (or the single item a path names) without
+// measuring anything. hidden counts dot-items left out because -a wasn't given.
+func readEntries(path string, o *Options) (entries []*Entry, hidden int, st syscall.Stat_t, isDir bool, err error) {
+	if err = syscall.Stat(path, &st); err != nil {
+		err = &os.PathError{Op: "stat", Path: path, Err: err}
+		return
 	}
-	sc := NewScanner(o.Disk, o.OneFS)
-
-	var entries []*Entry
-	hidden := 0
-	isDir := st.Mode&syscall.S_IFMT == syscall.S_IFDIR
+	isDir = st.Mode&syscall.S_IFMT == syscall.S_IFDIR
 	if isDir {
-		des, err := os.ReadDir(path)
-		if err != nil && len(des) == 0 {
-			return err
+		des, rerr := os.ReadDir(path)
+		if rerr != nil && len(des) == 0 {
+			err = rerr
+			return
 		}
 		for _, de := range des {
 			if !o.All && strings.HasPrefix(de.Name(), ".") {
@@ -551,13 +615,43 @@ func listView(path string, o *Options, p *Painter) error {
 			}
 			entries = append(entries, newEntry(cp, de.Name(), &cst, o.Disk))
 		}
-	} else {
-		var lst syscall.Stat_t
-		if err := syscall.Lstat(path, &lst); err != nil {
-			return err
-		}
-		entries = append(entries, newEntry(path, path, &lst, o.Disk))
+		return
 	}
+	var lst syscall.Stat_t
+	if err = syscall.Lstat(path, &lst); err != nil {
+		return
+	}
+	entries = append(entries, newEntry(path, path, &lst, o.Disk))
+	return
+}
+
+// printTitle draws the amber path heading used by every view.
+func printTitle(path string, width int, p *Painter) {
+	gw := p.gutterW()
+	abs, _ := filepath.Abs(path)
+	for j, l := range wrapSpans([]span{{safeName(abs), "1;" + p.amber}}, width-gw) {
+		lead := []span{{strings.Repeat(" ", gw), ""}}
+		if j == 0 && p.on {
+			lead = []span{{" ", ""}, {"▌", p.amber}, {" ", ""}}
+		}
+		fmt.Println(p.render(append(lead, l...)))
+	}
+}
+
+// printIndented wraps spans to the width and prints them past the gutter.
+func printIndented(sp []span, width int, p *Painter) {
+	gw := p.gutterW()
+	for _, l := range wrapSpans(sp, width-gw) {
+		fmt.Println(p.render(append([]span{{strings.Repeat(" ", gw), ""}}, l...)))
+	}
+}
+
+func listView(path string, o *Options, p *Painter) error {
+	entries, hidden, st, isDir, err := readEntries(path, o)
+	if err != nil {
+		return err
+	}
+	sc := NewScanner(o.Disk, o.OneFS)
 
 	if !o.NoSize {
 		stop := progress(sc)
@@ -585,19 +679,17 @@ func listView(path string, o *Options, p *Painter) error {
 	}
 	sortEntries(entries, o)
 
+	var thumbs map[*Entry]*thumbCell
+	if tp := planThumbs(o, p); tp != nil {
+		thumbs = makeThumbs(entries, tp)
+	}
+
 	width := outWidth(o)
 	gw := p.gutterW()
 
 	// ---- title block
-	abs, _ := filepath.Abs(path)
+	printTitle(path, width, p)
 	titleW := width - gw
-	for j, l := range wrapSpans([]span{{safeName(abs), "1;" + p.amber}}, titleW) {
-		lead := []span{{strings.Repeat(" ", gw), ""}}
-		if j == 0 && p.on {
-			lead = []span{{" ", ""}, {"▌", p.amber}, {" ", ""}}
-		}
-		fmt.Println(p.render(append(lead, l...)))
-	}
 	if isDir {
 		var total int64
 		for _, e := range entries {
@@ -624,22 +716,42 @@ func listView(path string, o *Options, p *Painter) error {
 
 	rows := make([]*row, len(entries))
 	for i, e := range entries {
-		rows[i] = makeRow(e, o, p)
+		rows[i] = makeRow(e, o, p, thumbs)
 	}
 
 	// ---- pick the richest layout that fits
-	var chosen *layout
-	var cols []*column
-	for i := range tiers {
-		l := tiers[i]
-		if o.Wide && l.letters {
-			continue
-		}
-		c := buildColumns(rows, l, p)
-		if width == 0 || gw+fixedWidth(c)+minNameW <= width {
-			chosen, cols = &l, c
+	thumbW := 0
+	for _, r := range rows {
+		if r.thumb != nil {
+			thumbW = o.ThumbW
 			break
 		}
+	}
+	var chosen *layout
+	var cols []*column
+	pick := func(ladder []layout, tw int) bool {
+		extra := 0
+		if tw > 0 {
+			extra = tw + len(gap)
+		}
+		for i := range ladder {
+			l := ladder[i]
+			if o.Wide && l.letters && !l.compact {
+				continue
+			}
+			c := buildColumns(rows, l, p)
+			if width == 0 || gw+extra+fixedWidth(c)+minNameW <= width {
+				chosen, cols = &l, c
+				return true
+			}
+		}
+		return false
+	}
+	if o.Long {
+		pick(longTiers, 0)
+	} else if !pick(compactTiers, thumbW) && thumbW > 0 {
+		thumbW = 0 // too narrow for pictures beside the table
+		pick(compactTiers, 0)
 	}
 
 	if chosen == nil {
@@ -650,8 +762,11 @@ func listView(path string, o *Options, p *Painter) error {
 		nameW := 0
 		if width > 0 {
 			nameW = width - gw - fixedWidth(cols)
+			if thumbW > 0 {
+				nameW -= thumbW + len(gap)
+			}
 		}
-		printTable(rows, cols, nameW, p)
+		printTable(rows, cols, nameW, thumbW, p)
 	}
 
 	// ---- footer
@@ -671,10 +786,21 @@ func listView(path string, o *Options, p *Painter) error {
 		}
 	}
 	if chosen != nil && chosen.letters {
-		legend := []span{{"OWN / GRP / ALL", "2;1"}, {"  r read · w write · x run (files) or enter (folders) · --wide for words", "2"}}
-		for _, l := range wrapSpans(legend, width-gw) {
-			fmt.Println(p.render(append([]span{{strings.Repeat(" ", gw), ""}}, l...)))
+		hint := "  r read · w write · x run (files) or enter (folders) · --wide for words"
+		if chosen.compact {
+			hint = "  r read · w write · x run (files) or enter (folders) · -l spells it out"
 		}
+		printIndented([]span{{"OWN / GRP / ALL", "2;1"}, {hint, "2"}}, width, p)
+	}
+	noFF := 0
+	for _, t := range thumbs {
+		if t.noFF {
+			noFF++
+		}
+	}
+	if noFF > 0 && thumbW > 0 {
+		printIndented([]span{{fmt.Sprintf("%d item(s) have no preview because ffmpeg isn't installed", noFF), "2"},
+			{" (sudo apt install ffmpeg / sudo dnf install ffmpeg)", "2"}}, width, p)
 	}
 	if d := sc.denied.Load(); d > 0 {
 		warn := []span{{"⚠ ", p.amber}, {fmt.Sprintf("%s folder(s) inside couldn't be read, so sizes marked ≥ are minimums.", commas(d)), p.amber},
